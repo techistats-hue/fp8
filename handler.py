@@ -40,42 +40,19 @@ from PIL import Image
 HF_CACHE             = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
 DIFFSYNTH_MODELS_DIR = os.environ.get("DIFFSYNTH_MODEL_BASE_PATH", "/app/models")
 
-# Comfy-Org/Qwen-Image_ComfyUI split_files layout on the RunPod volume:
-#   <COMFY_CACHE_DIR>/diffusion_models/qwen_image_fp8mixed.safetensors
-#   <COMFY_CACHE_DIR>/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
-#   <COMFY_CACHE_DIR>/vae/qwen_image_vae.safetensors
-COMFY_CACHE_DIR = os.environ.get("COMFY_CACHE_DIR", "/workspace/ComfyUI/models")
-
-COMFY_SEARCH_ROOTS = [
-    COMFY_CACHE_DIR,   # set to exact snapshot/split_files path via env var
-    # Fallback: walk the snapshot tree dynamically
-    "/runpod-volume/huggingface-cache/hub/models--comfy-org--qwen-image_comfyui/snapshots/c232bcb51c1523899c62d6dcaa960b2627668de5/split_files",
-    "/runpod-volume/huggingface-cache",
-    "/runpod-volume/models",
-    "/workspace/ComfyUI/models",   # kept as last-resort if mount changes
-]
+# Comfy-Org repo cached on the RunPod volume under the HF hub cache layout.
+# Revision is pinned to the confirmed snapshot hash (also set as MODEL_REVISION env var).
+COMFY_REPO_ID  = "comfy-org/qwen-image_comfyui"
+COMFY_REVISION = os.environ.get("MODEL_REVISION", "c232bcb51c1523899c62d6dcaa960b2627668de5")
 
 FP8_FILES = {
-    "diffusion":    "diffusion_models/qwen_image_fp8mixed.safetensors",
-    "text_encoder": "text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
-    "vae":          "vae/qwen_image_vae.safetensors",
+    "diffusion":    "split_files/diffusion_models/qwen_image_fp8mixed.safetensors",
+    "text_encoder": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "vae":          "split_files/vae/qwen_image_vae.safetensors",
 }
 
 pipe          = None
 _loaded_alpha = 0.125
-
-# ─── FP8 File Locator ─────────────────────────────────────────────────────────
-def find_fp8_file(key: str) -> str | None:
-    rel = FP8_FILES[key]
-    for root in COMFY_SEARCH_ROOTS:
-        if not root or not os.path.exists(root):
-            continue
-        candidate = os.path.join(root, rel)
-        if os.path.isfile(candidate):
-            size_gb = os.path.getsize(candidate) / (1024 ** 3)
-            print(f"[FP8] ✅ {key} → {candidate}  ({size_gb:.2f} GB)")
-            return candidate
-    return None
 
 # ─── HF Snapshot Locator (processor only, purely local) ──────────────────────
 def find_snapshot_path(model_id, name="Component"):
@@ -96,17 +73,24 @@ def find_snapshot_path(model_id, name="Component"):
     return None
 
 # ─── Preflight Check ──────────────────────────────────────────────────────────
-def prepare_cache() -> dict:
+def prepare_cache():
     print(f"\n{'='*60}\n{'[Cache] FP8 READY-CHECK (RTX 5090)':^60}\n{'='*60}")
-    missing   = []
-    fp8_paths = {}
+    missing = []
 
-    for key in FP8_FILES:
-        path = find_fp8_file(key)
-        if path:
-            fp8_paths[key] = path
+    # Verify FP8 files exist at their known snapshot location
+    snap_root = os.path.join(
+        HF_CACHE, "hub",
+        "models--comfy-org--qwen-image_comfyui",
+        "snapshots",
+        os.environ.get("MODEL_REVISION", "c232bcb51c1523899c62d6dcaa960b2627668de5"),
+    )
+    for key, rel in FP8_FILES.items():
+        full = os.path.join(snap_root, rel)
+        if os.path.isfile(full):
+            size_gb = os.path.getsize(full) / (1024**3)
+            print(f"[FP8] ✅ {key} ({size_gb:.2f} GB)")
         else:
-            print(f"[FP8] ❌ {key} MISSING  searched: {COMFY_SEARCH_ROOTS}")
+            print(f"[FP8] ❌ {key} MISSING — expected: {full}")
             missing.append(f"fp8/{key}")
 
     lora_path = "/app/models/lora/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
@@ -128,14 +112,12 @@ def prepare_cache() -> dict:
     if missing:
         raise RuntimeError(
             f"Missing components: {missing}\n"
-            f"Expected FP8 files at:\n"
-            f"  {COMFY_CACHE_DIR}/diffusion_models/qwen_image_fp8mixed.safetensors\n"
-            f"  {COMFY_CACHE_DIR}/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors\n"
-            f"  {COMFY_CACHE_DIR}/vae/qwen_image_vae.safetensors\n"
-            f"Set COMFY_CACHE_DIR env var if your volume mount differs."
+            f"Expected FP8 files under: {snap_root}\n"
+            f"  {FP8_FILES['diffusion']}\n"
+            f"  {FP8_FILES['text_encoder']}\n"
+            f"  {FP8_FILES['vae']}\n"
+            f"Set MODEL_REVISION env var if snapshot hash differs."
         )
-
-    return fp8_paths
 
 # ─── Patching ─────────────────────────────────────────────────────────────────
 try:
@@ -154,19 +136,16 @@ def load_model():
     global pipe, _loaded_alpha
     start_load = time.time()
 
-    fp8_paths = prepare_cache()
+    prepare_cache()
 
     vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     safe_limit = max(16.0, vram_total - 6.0)
     print(f"[VRAM] Total={vram_total:.1f}GB  Safe limit={safe_limit:.1f}GB")
 
-    # ── CRITICAL: use absolute local paths, NOT HuggingFace repo IDs ──────
-    # Passing a real HF model_id to ModelConfig causes DiffSynth to call the
-    # Hub API for file resolution → throttling/hangs even with HF_HUB_OFFLINE=1
-    # because some code paths bypass the env-var check.
-    # Solution: set model_id to a dummy local string and pass the resolved
-    # absolute file path directly as origin_file_pattern.
-    # ──────────────────────────────────────────────────────────────────────
+    # ModelConfig needs the real cached repo ID + revision so DiffSynth can
+    # locate the local HF snapshot folder without any network call.
+    # cache_dir points directly to the volume hub root.
+    # local_files_only=True ensures it never attempts a download.
 
     fp8_compute = dict(
         onload_dtype        = torch.float8_e4m3fn,  # FP8 stored in VRAM
@@ -197,19 +176,28 @@ def load_model():
         device        = "cuda",
         model_configs = [
             ModelConfig(
-                model_id            = "local/diffusion",           # dummy — never resolved
-                origin_file_pattern = fp8_paths["diffusion"],      # absolute path on volume
+                model_id            = COMFY_REPO_ID,
+                origin_file_pattern = "split_files/diffusion_models/qwen_image_fp8mixed.safetensors",
+                revision            = COMFY_REVISION,
+                cache_dir           = os.path.join(HF_CACHE, "hub"),
+                local_files_only    = True,
                 **fp8_compute,
             ),
             ModelConfig(
-                model_id            = "local/text_encoder",
-                origin_file_pattern = fp8_paths["text_encoder"],
+                model_id            = COMFY_REPO_ID,
+                origin_file_pattern = "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                revision            = COMFY_REVISION,
+                cache_dir           = os.path.join(HF_CACHE, "hub"),
+                local_files_only    = True,
                 **fp8_compute,
             ),
             ModelConfig(
-                model_id            = "local/vae",
-                origin_file_pattern = fp8_paths["vae"],
-                **bf16_only,                                       # BF16 for decode quality
+                model_id            = COMFY_REPO_ID,
+                origin_file_pattern = "split_files/vae/qwen_image_vae.safetensors",
+                revision            = COMFY_REVISION,
+                cache_dir           = os.path.join(HF_CACHE, "hub"),
+                local_files_only    = True,
+                **bf16_only,
             ),
         ],
         processor_config = ModelConfig(
