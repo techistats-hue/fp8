@@ -73,16 +73,16 @@ RUN echo '{"model_type": "qwen2_5_vl"}' > /app/models/processor/config.json \
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* && rm -rf /root/.cache/pip
 
 # ─── Environment Variables ────────────────────────────────────────────────────
-# RunPod network volume HF cache root
-ENV HF_HOME=/workspace/huggingface-cache
-ENV MODELSCOPE_CACHE=/workspace/huggingface-cache
+# Volume is mounted at /runpod-volume (NOT /workspace on this pod)
+ENV HF_HOME=/runpod-volume/huggingface-cache
+ENV MODELSCOPE_CACHE=/runpod-volume/huggingface-cache
 # DiffSynth paths
 ENV DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
 ENV DIFFSYNTH_MODEL_BASE_PATH=/app/models
-# Comfy-Org split_files cache root on the RunPod volume.
-# Override at container launch if your volume mount point differs.
-ENV COMFY_CACHE_DIR=/workspace/ComfyUI/models
-# Stay fully offline — weights must be on the volume
+# Exact snapshot path confirmed from volume scan.
+# Points directly to split_files root — no runtime search needed.
+ENV COMFY_CACHE_DIR=/runpod-volume/huggingface-cache/hub/models--comfy-org--qwen-image_comfyui/snapshots/c232bcb51c1523899c62d6dcaa960b2627668de5/split_files
+# Stay fully offline — weights are on the volume
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 # Blackwell / large-tensor allocator settings
