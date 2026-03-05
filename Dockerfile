@@ -1,8 +1,10 @@
 # ───────────────────────────────────────────────────────────────────────────────
 # Qwen-Image-Edit-2511 on RunPod Serverless
 # Uses DiffSynth-Studio — pure Python, NO CUDA extension compilation needed.
-# Optimized for RTX 5090 (32GB VRAM) with ComfyOrg FP8-mixed weights.
-# Weights are NOT baked — loaded at runtime from RunPod Network Volume cache.
+# Optimized for RTX 5090 (32GB VRAM, Blackwell SM_120) with FP8 weights.
+# Large FP8 weights (diffusion, text_encoder, vae) are loaded at runtime from
+# the RunPod network volume cache — NOT baked into the image.
+# Small files (LoRA, processor tokenizer) are baked in at build time.
 # ───────────────────────────────────────────────────────────────────────────────
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
@@ -13,27 +15,42 @@ ENV CUDA_HOME=/usr/local/cuda
 
 # 1. System Dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip python3-dev git wget \
+    python3.11 python3-pip python3-dev git wget curl \
     libgl1-mesa-glx libglib2.0-0 \
-    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && pip install --no-cache-dir --upgrade pip
 
-# 2. PyTorch for CUDA 12.8 + Blackwell (RTX 5090)
-#    torch 2.7+ has native FP8 (torch.float8_e4m3fn) support for GB202
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# 2. PyTorch — nightly cu128 required for Blackwell / SM_120 (RTX 5090)
+#    Once stable 2.7+ is released, pin to a stable wheel instead.
+RUN pip install --no-cache-dir \
+    --pre torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # 3. Python Packages
 RUN pip install --no-cache-dir \
-    transformers accelerate peft \
+    transformers>=4.51.0 accelerate peft \
     sentencepiece protobuf ftfy \
     Pillow einops \
-    runpod huggingface_hub
+    runpod huggingface_hub modelscope \
+    safetensors
 
 # 4. DiffSynth-Studio
 RUN pip install --no-cache-dir git+https://github.com/modelscope/DiffSynth-Studio.git
 
-# 5. Bake processor files only (tiny, no model weights needed at build time)
+# ─── Baked Small Files ────────────────────────────────────────────────────────
+# Only small, non-GPU-intensive files are baked: LoRA + processor tokenizer.
+# The three large FP8 safetensors are loaded at cold-start from the RunPod
+# network volume (see COMFY_CACHE_DIR env var and handler.py).
+# ─────────────────────────────────────────────────────────────────────────────
+
 RUN mkdir -p /app/models/lora /app/models/processor
+
+# Bake: Lightning 4-step LoRA (small, ~200MB)
+RUN wget -q --show-progress -O /app/models/lora/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+
+# Bake: Processor / Tokenizer small config files
 RUN echo '{"model_type": "qwen2_5_vl"}' > /app/models/processor/config.json \
     && wget -q -O /app/models/processor/added_tokens.json \
         https://huggingface.co/Qwen/Qwen-Image-Edit-2511/resolve/main/processor/added_tokens.json \
@@ -55,25 +72,21 @@ RUN echo '{"model_type": "qwen2_5_vl"}' > /app/models/processor/config.json \
 # Cleanup
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* && rm -rf /root/.cache/pip
 
-# ─── Runtime Env ──────────────────────────────────────────────────────────────
-# RunPod Network Volume cache (set this in your RunPod template)
-ENV HF_HOME=/runpod-volume/huggingface-cache
-ENV MODELSCOPE_CACHE=/runpod-volume/huggingface-cache
-
-# ComfyOrg FP8 model paths on RunPod volume
-# diffusion model  → qwen_image_edit_2511_fp8mixed.safetensors
-# text encoder     → qwen_2.5_vl_7b_fp8_scaled.safetensors
-ENV COMFY_DIFFUSION_MODEL=/runpod-volume/models/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors
-ENV COMFY_TEXT_ENCODER=/runpod-volume/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
-
+# ─── Environment Variables ────────────────────────────────────────────────────
+# RunPod network volume HF cache root
+ENV HF_HOME=/workspace/huggingface-cache
+ENV MODELSCOPE_CACHE=/workspace/huggingface-cache
+# DiffSynth paths
 ENV DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
 ENV DIFFSYNTH_MODEL_BASE_PATH=/app/models
-
-# RTX 5090: large VRAM, less fragmentation pressure — but keep expandable for safety
+# Comfy-Org split_files cache root on the RunPod volume.
+# Override at container launch if your volume mount point differs.
+ENV COMFY_CACHE_DIR=/workspace/ComfyUI/models
+# Stay fully offline — weights must be on the volume
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+# Blackwell / large-tensor allocator settings
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# Flash Attention 3 (available on Blackwell via torch 2.7)
-ENV TORCH_SDPA_BACKEND=flash_attention
 
 WORKDIR /app
 COPY handler.py .
